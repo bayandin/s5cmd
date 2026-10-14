@@ -1265,7 +1265,7 @@ func (sc *SessionCache) newSession(ctx context.Context, opts Options) (*session.
 		endpointURL = sentinelURL
 	}
 
-	var httpClient *http.Client
+	httpClient := defaultHTTPClient
 	if opts.NoVerifySSL {
 		httpClient = insecureHTTPClient
 	}
@@ -1407,11 +1407,23 @@ func (c *customRetryer) ShouldRetry(req *request.Request) bool {
 	return shouldRetry
 }
 
-var insecureHTTPClient = &http.Client{
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		Proxy:           http.ProxyFromEnvironment,
-	},
+var (
+	defaultHTTPClient  = newHTTPClient(false)
+	insecureHTTPClient = newHTTPClient(true)
+)
+
+func newHTTPClient(noVerifySSL bool) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Keep connections for the default 256 workers instead of Go's two per host.
+	transport.MaxIdleConns = 512
+	transport.MaxIdleConnsPerHost = 256
+	if noVerifySSL {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.InsecureSkipVerify = true
+	}
+	return &http.Client{Transport: transport}
 }
 
 func supportsTransferAcceleration(endpoint urlpkg.URL) bool {

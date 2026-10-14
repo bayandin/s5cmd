@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	urlpkg "net/url"
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -130,6 +132,99 @@ func TestNewSessionWithNoSignRequest(t *testing.T) {
 	if expected != got {
 		t.Fatalf("expected %v, got %v", expected, got)
 	}
+}
+
+func TestSessionReusesUploadConnections(t *testing.T) {
+	log.Init("error", false)
+	for _, noVerifySSL := range []bool{false, true} {
+		t.Run(fmt.Sprintf("noVerifySSL=%t", noVerifySSL), func(t *testing.T) {
+			const workers = 8
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			var connections int32
+			var arrived int32
+			gates := []chan struct{}{make(chan struct{}), make(chan struct{})}
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+					t.Error(err)
+					return
+				}
+				n := atomic.AddInt32(&arrived, 1)
+				gate := gates[(n-1)/workers]
+				// Each batch must have all workers in flight before any can finish.
+				if n%workers == 0 {
+					close(gate)
+				}
+				select {
+				case <-gate:
+					w.Header().Set("ETag", `"etag"`)
+				case <-ctx.Done():
+					http.Error(w, ctx.Err().Error(), http.StatusRequestTimeout)
+				}
+			}))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					atomic.AddInt32(&connections, 1)
+				}
+			}
+			if noVerifySSL {
+				server.StartTLS()
+			} else {
+				server.Start()
+			}
+			defer server.Close()
+
+			cache := &SessionCache{sessions: map[Options]*session.Session{}}
+			for batch := 0; batch < len(gates); batch++ {
+				// Separate bucket sessions should share the same connection pool.
+				bucket := fmt.Sprintf("bucket-%d", batch)
+				sess, err := cache.newSession(ctx, Options{
+					Endpoint:      server.URL,
+					NoSignRequest: true,
+					NoVerifySSL:   noVerifySSL,
+					LogLevel:      log.LevelError,
+					region:        "us-east-1",
+					bucket:        bucket,
+				})
+				assert.NilError(t, err)
+				defer sess.Config.HTTPClient.CloseIdleConnections()
+				client := s3.New(sess)
+				var wg sync.WaitGroup
+				for i := 0; i < workers; i++ {
+					wg.Add(1)
+					go func(i int) {
+						defer wg.Done()
+						_, err := client.PutObjectWithContext(ctx, &s3.PutObjectInput{
+							Bucket: aws.String(bucket),
+							Key:    aws.String(fmt.Sprintf("object-%d", i)),
+							Body:   strings.NewReader("test data"),
+						})
+						assert.Check(t, err == nil, "upload failed: %v", err)
+					}(i)
+				}
+				wg.Wait()
+				assert.Equal(t, atomic.LoadInt32(&connections), int32(workers),
+					"batch %d should reuse the original connections", batch)
+			}
+		})
+	}
+}
+
+func TestSessionVerifiesTLS(t *testing.T) {
+	log.Init("error", false)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+	cache := &SessionCache{sessions: map[Options]*session.Session{}}
+	sess, err := cache.newSession(context.Background(), Options{
+		Endpoint:      server.URL,
+		NoSignRequest: true,
+		LogLevel:      log.LevelError,
+		region:        "us-east-1",
+	})
+	assert.NilError(t, err)
+	_, err = s3.New(sess).HeadBucket(&s3.HeadBucketInput{Bucket: aws.String("bucket")})
+	assert.ErrorContains(t, err, "certificate")
 }
 
 func TestNewSessionWithProfileFromFile(t *testing.T) {
